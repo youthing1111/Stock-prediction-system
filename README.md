@@ -1,10 +1,45 @@
 # Stock-prediction-system
 
-An automated daily pipeline for ACB (Asia Commercial Bank, HOSE) stock prices. Every trading day it scrapes the latest quotes, builds technical-indicator features, predicts the next close with XGBoost, and publishes a chart to a GitHub Pages site.
+An automated daily pipeline for ACB (Asia Commercial Bank, HOSE) stock prices. Every trading day it scrapes the latest quotes, builds features with Spark, forecasts the next 30 trading days with a small XGBoost model, and publishes a chart to a GitHub Pages site.
 
 **Tools used:** Airflow 3, PostgreSQL, MinIO, MLflow, Spark, Docker Compose, Python.
 
-![Pipeline Diagram](Stock_Prediction_System_Diagram.png)
+```mermaid
+flowchart LR
+    src["Stockbiz.vn<br/>daily quotes"]
+    t1["<b>1. update_data</b><br/>BeautifulSoup scraper"]
+    stock[("PostgreSQL<br/>acb_stock")]
+    t2["<b>2. spark_submit_task</b><br/>Spark feature job"]
+    feat[("PostgreSQL<br/>acb_features")]
+    t3["<b>3. prediction_2</b><br/>30-day simulated forecast"]
+    fc[("PostgreSQL<br/>acb_forecast")]
+    gh["GitHub Pages<br/>forecast chart"]
+    train["MLFlow/model.py<br/>training, run manually"]
+    mlflow["MLflow<br/>model registry"]
+    minio[("MinIO<br/>model files, chart,<br/>CSV backups")]
+
+    src -- scrape --> t1 -- upsert --> stock
+    stock -- read --> t2 -- rebuild --> feat
+    stock -- read --> t3
+    feat -- consistency check --> t3
+    stock -- read --> train -- register version --> mlflow
+    mlflow -- load newest model --> t3
+    t3 -- save --> fc
+    t3 -- publish --> gh
+    mlflow -. model files .-> minio
+    t3 -. "chart + backups (all tasks)" .-> minio
+
+    classDef task fill:#fde2f3,stroke:#c2185b,color:#000
+    classDef db fill:#e3f0ff,stroke:#1565c0,color:#000
+    classDef ml fill:#e8f5e9,stroke:#2e7d32,color:#000
+    classDef ext fill:#f5f5f5,stroke:#616161,color:#000
+    class t1,t2,t3 task
+    class stock,feat,fc db
+    class train,mlflow,minio ml
+    class src,gh ext
+```
+
+Everything runs in Docker Compose. Pink boxes are the Airflow tasks (daily at 13:30 UTC), blue are PostgreSQL tables, green is the MLflow/MinIO model side.
 
 ## How it works
 
