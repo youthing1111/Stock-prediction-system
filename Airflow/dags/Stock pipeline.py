@@ -1,23 +1,25 @@
-from github import Github
+import os
 from datetime import datetime, timedelta
+from io import StringIO
+
+import boto3
+import mlflow
+import mlflow.xgboost
+import numpy as np
+import pandas as pd
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.models.connection import Connection
-import pandas as pd
-from sqlalchemy import create_engine
-from bs4 import BeautifulSoup
-import requests
-import pandas as pd 
-import numpy as np
-import boto3
-from airflow.hooks.base import BaseHook
-from matplotlib import pyplot as plt
-import matplotlib.dates as mdates
-import io 
-from xgboost import XGBRegressor
-from io import StringIO
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from github import Auth, Github, UnknownObjectException
+# Long-lived Celery workers cache directory listings; on Docker Desktop bind
+# mounts a module added after the worker started can stay invisible. Refresh first.
+import importlib
+importlib.invalidate_caches()
+import acb_scraper
+import acb_chart
+import acb_features
+import acb_model
 
 default_args = {
     'owner': 'admin',
@@ -30,206 +32,123 @@ default_args = {
     'retry_delay': timedelta(minutes=1)
 }
 
-c = Connection(
-    conn_id='postgres',
-    conn_type='Postgres',
-    login='airflow',
-    password='airflow'
-)
+MODEL_NAME = 'ACB price prediction'  # registered model in MLflow
+
+def minio():
+    # Credentials come from config.env via docker-compose (never hardcode them here)
+    return boto3.resource('s3',
+                          endpoint_url=os.environ.get('MINIO_ENDPOINT', 'http://host.docker.internal:9005'),
+                          aws_access_key_id=os.environ['MINIO_ACCESS_KEY'],
+                          aws_secret_access_key=os.environ['MINIO_SECRET_ACCESS_KEY'])
 
 def update_data():
-    #get old data from postgres
+    # Scrape the last ~30 trading days and upsert them, keyed by the trading
+    # date printed on the page. Re-running is safe; missed days self-heal.
+    end = acb_scraper.latest_final_date()
+    rows = acb_scraper.fetch_page('ACB', end)
+    rows = [r for r in rows if r['date'] <= end]
+    if not rows:
+        raise RuntimeError(f'no ACB quotes scraped for page ending {end}')
+
     hook = PostgresHook(postgres_conn_id="postgres")
-    sql_ts = """ SELECT * FROM public."acb_stock" """
-    df_old = hook.get_pandas_df(sql_ts)
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            acb_scraper.upsert(cur, rows, 'acb_stock')
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"upserted {len(rows)} rows, latest {rows[0]['date']}")
 
-    #new data from source
-    date  = datetime.today().strftime('%Y-%m-%d')
-    close = []
-    open = []
-    high = []
-    low = []
-    volume = []
-    html = requests.get(f'http://en.stockbiz.vn/Stocks/ACB/LookupQuote.aspx?date={date}').text
-    soup = BeautifulSoup(html)
-    table = soup.find('table')
-    div1 = table.find('div',{'id':'mainwrap'})
-    div2 = div1.find('div',{'id':'container'})
-    table1 = div1.find('table',{'id':'ctl00_PlaceHolderContentArea_CenterZone'})
-    tr1 = table1.find_all('tr',{'class':'rowcolor2'})
-    tr2 = table1.find_all('tr',{'class':'rowcolor1'})
-    for row in tr1:
-        stock_price = row.find_all('td',attrs={'align':'right'})[4].text
-        close.append(stock_price.strip())
-    for row in tr2:
-        stock_price = row.find_all('td',attrs={'align':'right'})[4].text
-        close.append(stock_price.strip())
-    close.append(stock_price.strip())
-    for row in tr1:
-        stock_price = row.find_all('td',attrs={'align':'right'})[1].text
-        open.append(stock_price.strip())
-    for row in tr2:
-        stock_price = row.find_all('td',attrs={'align':'right'})[1].text
-        open.append(stock_price.strip())
-    open.append(stock_price.strip())
-    for row in tr1:
-        stock_price = row.find_all('td',attrs={'align':'right'})[2].text
-        high.append(stock_price.strip())
-    for row in tr2:
-        stock_price = row.find_all('td',attrs={'align':'right'})[2].text
-        high.append(stock_price.strip())
-    high.append(stock_price.strip())
-    for row in tr1:
-        stock_price = row.find_all('td',attrs={'align':'right'})[3].text
-        low.append(stock_price.strip())
-    for row in tr2:
-        stock_price = row.find_all('td',attrs={'align':'right'})[3].text
-        low.append(stock_price.strip())
-    low.append(stock_price.strip())
-    for row in tr1:
-        stock_price = row.find_all('td',attrs={'align':'right'})[7].text
-        volume.append(stock_price.strip())
-    for row in tr2:
-        stock_price = row.find_all('td',attrs={'align':'right'})[7].text
-        volume.append(stock_price.strip())
-    volume.append(stock_price.strip())
-    volume[0] = volume[0].replace(',', '')
-    df_latest = pd.DataFrame({'OPEN':[open[0]],'HIGH':high[0],'LOW':low[0],'close':[close[0]],'VOLUME':volume[0]})
-    df_latest['OPEN'] = df_latest['OPEN'].astype(float).apply(lambda x: x*1000)
-    df_latest['HIGH'] = df_latest['HIGH'].astype(float).apply(lambda x: x*1000)
-    df_latest['LOW'] = df_latest['LOW'].astype(float).apply(lambda x: x*1000)
-    df_latest['close'] = df_latest['close'].astype(float).apply(lambda x: x*1000)
-    df_latest['VOLUME'] = df_latest['VOLUME'].astype(float)
-
-    #concat data
-    conn = BaseHook.get_connection('postgres')
-    engine = create_engine(f'postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}')
-    df_old = df_old.sort_values(by='date')
-    df_old.set_index("date",inplace=True)
-    df_latest.rename(index={0:date},inplace=True)
-    df_latest = df_latest.rename(columns={'HIGH': 'high', 'LOW': 'low','close':'close','OPEN':'open','VOLUME':'volume'})
-    df_latest['volume'] = df_latest['volume']/1000000
-    df_full = pd.concat([df_old, df_latest])
-    df_full.reset_index(names="date",inplace=True)
-
-    #store in postgres and minio
-    if set(df_full[['close','open','high','low','volume']].iloc[-2]) == set(df_full[['close','open','high','low','volume']].iloc[-1]):
-        print('asdeqfwe')
-    else:
-        df_full.to_sql(f'acb_stock', engine, if_exists='replace', index=False)
-        df_35 = df_full.iloc[-26:]
+    #backup copy of the latest rows to minio (spark_task reads Postgres directly).
+    # Best effort: a MinIO outage must not block the pipeline.
+    try:
+        df_35 = hook.get_pandas_df('SELECT * FROM acb_stock ORDER BY date DESC LIMIT 26').iloc[::-1]
         csv_buffer = StringIO()
-        df_35.to_csv(csv_buffer)
-        s3 = boto3.resource('s3',
-                        endpoint_url='http://host.docker.internal:9005',
-                        aws_access_key_id='',
-                        aws_secret_access_key='')
-        s3.Object('mlflow-artifacts', 'data_copy.csv').put(Body=csv_buffer.getvalue())
+        df_35.to_csv(csv_buffer, index=False)
+        minio().Object('mlflow-artifacts', 'data_copy.csv').put(Body=csv_buffer.getvalue())
+    except Exception as e:
+        print(f"WARNING: MinIO backup of data_copy.csv failed: {e}")
+
+def resolve_model_uri():
+    """MLFLOW_MODEL_URI if set, else the newest READY registered version (pinned, so it's logged exactly)."""
+    if os.environ.get('MLFLOW_MODEL_URI'):
+        return os.environ['MLFLOW_MODEL_URI']
+    versions = [v for v in mlflow.MlflowClient().search_model_versions(f"name='{MODEL_NAME}'")
+                if v.status == 'READY']
+    if not versions:
+        raise RuntimeError(f'no versions of {MODEL_NAME!r} in the MLflow registry; run MLFlow/model.py')
+    return f"models:/{MODEL_NAME}/{max(int(v.version) for v in versions)}"
+
+
+def check_feature_store(hook, prices):
+    """The Spark-built feature table must be current and match the shared feature code."""
+    stored = hook.get_pandas_df(acb_features.LATEST_SQL)
+    if stored.empty:
+        raise RuntimeError(f'{acb_features.FEATURES_TABLE} is empty; did spark_submit_task run?')
+    last = pd.to_datetime(prices['date']).max().date()
+    if pd.to_datetime(stored['date'].iloc[0]).date() != last:
+        raise RuntimeError(f"{acb_features.FEATURES_TABLE} is stale: {stored['date'].iloc[0]} vs acb_stock {last}")
+    expected = acb_model.latest_features(prices)[acb_model.FEATURE_COLUMNS].to_numpy(dtype=float)
+    got = stored[acb_model.FEATURE_COLUMNS].to_numpy(dtype=float)
+    if not np.allclose(expected, got, rtol=1e-9, atol=1e-12):
+        raise RuntimeError('acb_features differs from acb_model.build_features: training/serving skew')
+
 
 def prediction_2():
-    #get transformed data for prediction
-    s3 = boto3.resource('s3',
-                        endpoint_url='http://host.docker.internal:9005',
-                        aws_access_key_id='',
-                        aws_secret_access_key=''
-    )
-    object = s3.Bucket("mlflow-artifacts").Object("data_transform.csv").get()['Body'].read()
-    s = str(object,'utf-8')
-    data = StringIO(s)
-    df = pd.read_csv(data)
-    df = df.drop(columns=['Unnamed: 0.1', 'Unnamed: 0'])
-    df_reorder = df[['close', 'open', 'high', 'low', 'volume', 'change', 'close_sma', 'close_wma', 'close_ema12', 'close_ema26', 'MACD', 'best_low', 'best_high', 'fast_k', 'fast_d', 'slow_k', 'slow_d', 'LW', 'Target', 'acc_dist', 'acc_dist_ema9', 'obv', 'obv_ema9', 'pvt', 'pvt_ema9', 'typical_price']]
-    input = df_reorder.iloc[[-1]]
+    hook = PostgresHook(postgres_conn_id="postgres")
+    prices = hook.get_pandas_df('SELECT date, close FROM acb_stock ORDER BY date')
+    check_feature_store(hook, prices)
 
-    #get model from minio
-    temp_model_location = './temp_model.pkl'
-    temp_model_file = open(temp_model_location, 'wb')
-    temp_model_file.write(s3.Bucket("mlflow-artifacts").Object("1/232bdcf2cc164c76bade410782fd9a48/artifacts/testmodel/model.xgb").get()['Body'].read())
-    temp_model_file.close()
-    model = XGBRegressor(enable_categorical=True)
-    model.load_model(temp_model_location)
-    pred = model.predict(input)
+    #load the model from the MLflow model registry
+    mlflow.set_tracking_uri(os.environ.get('MLFLOW_TRACKING_URI', 'http://host.docker.internal:5005'))
+    model_uri = resolve_model_uri()
+    model = mlflow.xgboost.load_model(model_uri)
+    print(f'loaded model {model_uri}')
 
-    #visualise
-    df_close = df[['date','close']]
-    df_close['date'] = pd.to_datetime(df_close['date'],format= '%Y-%m-%d')
-    date=datetime.today().strftime('%Y-%m-%d')
-    date_after = pd.to_datetime(date) + timedelta(days=1)
-    df_pred = pd.DataFrame([[date_after,round(pred[0],0)]], columns=['date','close'])
-    df_pred['date'] = pd.to_datetime(df_pred['date'],format= '%Y-%m-%d')
-    print(df_pred)
-    df_concat = pd.concat([df_close.iloc[[-1]], df_pred], ignore_index=True)
-    b = df_close
-    c = df_concat
-    fig, ax = plt.subplots()
-    ax.plot(b['date'].iloc[-3:],b['close'].iloc[-3:],color="gray", label = 'History price')
-    ax = plt.subplot(111)
-    ax.plot(c['date'],c['close'],color="red", label = 'Predicted price')
-    plt.title('ACB stock prediction', fontdict={'fontsize':20})
-    ax.set_xlabel('date')
-    ax.set_ylabel('Stock price (VND)')
-    ax.legend(loc="upper left")
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=2))
-    x = c['date']
-    y = c['close']
-    values  =c['close'].to_list()
-    for i, txt in enumerate(values):
-        ax.annotate(txt, (x[i], y[i]))
-    buf = io.BytesIO()
-    plt.savefig(buf, format="jpg")
-    temp_model_location = './plot.jpg'
-    temp_model_file = open(temp_model_location, 'wb')
-    temp_model_file.write(buf.getvalue())
-    temp_model_file.close()
-    buf.close()
-    plt.show()
-    s3.meta.client.upload_file(temp_model_location, 'mlflow-artifacts', 'plot.jpg')
-    content = s3.Bucket("mlflow-artifacts").Object("/plot.jpg").get()['Body'].read()
+    #simulated 30-trading-day forecast, same feature code as training.
+    # Seeded by the data date, so re-running a day reproduces the same forecast.
+    made_on = pd.to_datetime(prices['date']).max().date()
+    fc = acb_model.forecast(model, prices, acb_model.HORIZON, seed=int(f"{made_on:%Y%m%d}"))
+    print(f"forecast from {made_on}:\n{fc.to_string(index=False)}")
 
-    #upload to github website
-    g = Github("")
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            acb_features.save_forecast(cur, made_on, fc, model_uri)
+        conn.commit()
+    finally:
+        conn.close()
+
+    #chart: last 30 trading days + the expected path and its 10-90% band
+    content = acb_chart.render_chart(prices, fc)
+    s3 = minio()
+    s3.Object('mlflow-artifacts', 'plot.jpg').put(Body=content)
+    try:  # backup copy of the forecast (best effort)
+        buf = StringIO()
+        fc.assign(made_on=made_on, model_uri=model_uri).to_csv(buf, index=False)
+        s3.Object('mlflow-artifacts', 'forecast.csv').put(Body=buf.getvalue())
+    except Exception as e:
+        print(f"WARNING: MinIO backup of forecast.csv failed: {e}")
+
+    #upload to github website (thumbnail and full-size use the same image)
+    g = Github(auth=Auth.Token(os.environ['GITHUB_TOKEN']))
     repo = g.get_user().get_repo('StockPredict.github.io')
-    all_files = []
-    contents = repo.get_contents("")
-    while contents:
-        file_content = contents.pop(0)
-        if file_content.type == "dir":
-            contents.extend(repo.get_contents(file_content.path))
-        else:
-            file = file_content
-            all_files.append(str(file).replace('ContentFile(path="','').replace('")',''))
+    for path in ('images/thumbs/01.jpg', 'images/fulls/01.jpg'):
+        publish_file(repo, path, content)
 
-    # Upload to github
-    git_prefix = 'images/thumbs/'
-    git_file = git_prefix + '01.jpg'
-    if git_file in all_files:
-        contents = repo.get_contents(git_file)
-        repo.update_file(contents.path, "committing files", content, contents.sha, branch="main")
-        print(git_file + ' UPDATED')
+
+def publish_file(repo, path, content, branch="main"):
+    """Create or update one file in the GitHub repo (one lookup, no tree walk)."""
+    message = f"Update forecast plot {datetime.today():%Y-%m-%d}"
+    try:
+        existing = repo.get_contents(path, ref=branch)
+    except UnknownObjectException:
+        repo.create_file(path, message, content, branch=branch)
+        print(path + ' CREATED')
     else:
-        repo.create_file(git_file, "committing files", content, branch="main")
-        print(git_file + ' CREATED')
-
-    all_files = []
-    contents = repo.get_contents("")
-    while contents:
-        file_content = contents.pop(0)
-        if file_content.type == "dir":
-            contents.extend(repo.get_contents(file_content.path))
-        else:
-            file = file_content
-            all_files.append(str(file).replace('ContentFile(path="','').replace('")',''))
-
-    # Upload to github
-    git_prefix = 'images/fulls/'
-    git_file = git_prefix + '01.jpg'
-    if git_file in all_files:
-        contents = repo.get_contents(git_file)
-        repo.update_file(contents.path, "committing files", content, contents.sha, branch="main")
-        print(git_file + ' UPDATED')
-    else:
-        repo.create_file(git_file, "committing files", content, branch="main")
-        print(git_file + ' CREATED')
+        repo.update_file(path, message, content, existing.sha, branch=branch)
+        print(path + ' UPDATED')
 
 with DAG(
     dag_id="Stock_prediction",
@@ -245,8 +164,16 @@ with DAG(
 		application = "/opt/airflow/dags/spark_task.py",
         conn_id= 'spark',
 		task_id='spark_submit_task',
+        py_files='/opt/airflow/dags/acb_model.py',  # executors import the shared feature code
+        # The Spark driver reads/writes Postgres itself; hand it the "postgres"
+        # connection (rendered at run time, password masked in the UI).
         env_vars={
-            'YARN_CONF_DIR': '/opt/bitnami/spark/yarn'  
+            'YARN_CONF_DIR': '/opt/bitnami/spark/yarn',
+            'PG_HOST': '{{ conn.postgres.host }}',
+            'PG_PORT': '{{ conn.postgres.port }}',
+            'PG_DATABASE': '{{ conn.postgres.schema }}',
+            'PG_USER': '{{ conn.postgres.login }}',
+            'PG_PASSWORD': '{{ conn.postgres.password }}',
         }
 	)
     task_4 =PythonOperator(

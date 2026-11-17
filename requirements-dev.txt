@@ -1,0 +1,10 @@
+# For running scripts/backfill_acb.py and the tests on your machine
+# (the Airflow image has its own pinned set in Airflow/requirements.txt).
+requests==2.32.3
+beautifulsoup4==4.13.4
+psycopg2-binary==2.9.10
+pytest>=8,<9
+# chart tests (versions match the Airflow image)
+pandas==2.1.4
+numpy==1.26.4
+matplotlib==3.11.2

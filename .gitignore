@@ -1,0 +1,19 @@
+# OS / Python
+.DS_Store
+__pycache__/
+*.pyc
+
+# Secrets (copy config.env.example -> config.env)
+config.env
+.env
+Airflow/.env
+
+# Runtime data
+Airflow/logs/
+Airflow/airflow-data/
+Airflow/include/minio/
+MLFlow/mlruns/
+temp_model.pkl
+plot.jpg
+Airflow/config/
+Airflow/plugins/
