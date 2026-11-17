@@ -1,6 +1,9 @@
+name: stock-prediction-pipeline  # keep: existing containers/volumes belong to this project
+
 x-airflow-common:
   &airflow-common
   build: ./Airflow
+  image: stock-pipeline-airflow:3.0.0  # one shared image for all airflow services
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
@@ -8,18 +11,24 @@ x-airflow-common:
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
-    AIRFLOW__API_AUTH__JWT_SECRET: 'Jasudhwiuefw345s=='
-    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET in config.env}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in config.env}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:- airflow-provider-mlflow mlflow apache-airflow-providers-amazon apache-airflow-providers-postgres minio xgboost apache-airflow-providers-apache-spark}
+    # Secrets for DAG code, read from config.env (gitignored)
+    MINIO_ENDPOINT: http://host.docker.internal:${MINIO_PORT}
+    MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+    MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY}
+    GITHUB_TOKEN: ${GITHUB_TOKEN}
+    MLFLOW_TRACKING_URI: http://host.docker.internal:${MLFLOW_PORT}
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}  # packages are baked into Airflow/dockerfile
   volumes:
-    - /Users/trieuhoanghiep/Documents/Me/Project/Stock-prediction-pipeline/Airflow/dags:/opt/airflow/dags
-    - /Users/trieuhoanghiep/Documents/Me/Project/Stock-prediction-pipeline/Airflow/logs:/opt/airflow/logs
-    - /Users/trieuhoanghiep/Documents/Me/Project/Stock-prediction-pipeline/Airflow/config:/opt/airflow/config
-    - /Users/trieuhoanghiep/Documents/Me/Project/Stock-prediction-pipeline/Airflow/plugins:/opt/airflow/plugins
+    - ./Airflow/dags:/opt/airflow/dags
+    - ./Airflow/logs:/opt/airflow/logs
+    - ./Airflow/config:/opt/airflow/config
+    - ./Airflow/plugins:/opt/airflow/plugins
   user: "${AIRFLOW_UID:-501}:0"
   depends_on:
     &airflow-common-depends-on
@@ -35,6 +44,8 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
@@ -278,14 +289,14 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: stock
-    #volumes:
-    #  - ./Postgres/ACB_price.csv:/var/lib/postgresql/data
+    volumes:
+      - acb-db-data:/var/lib/postgresql/data
     ports:
       - 5434:5434
     networks:
       - backend
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD", "pg_isready", "-U", "airflow", "-p", "5434"]
       interval: 10s
       retries: 5
       start_period: 5s
@@ -296,8 +307,8 @@ services:
     restart: always
     image: minio/minio:RELEASE.2025-02-28T09-55-16Z-cpuv1
     container_name: ACB_Minio
-    #volumes:
-    #  - 'minio_data:/data'
+    volumes:
+      - minio-data:/data
     ports:
       - "${MINIO_PORT}:9005"
       - "${MINIO_CONSOLE_PORT}:9006"
@@ -313,7 +324,8 @@ services:
       - MINIO_CONSOLE_ADDRESS=${MINIO_CONSOLE_ADDRESS}
     command: server /data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9005/minio/health/live"]
+      # minio image has no curl; mc is bundled
+      test: ["CMD-SHELL", "MC_HOST_hc=http://localhost:9005 mc ready hc"]
       interval: 30s
       timeout: '20s'
       retries: 3
@@ -321,7 +333,7 @@ services:
   tracking_server:
     restart: always
     build: ./MLFlow
-    image: ghcr.io/mlflow/mlflow:latest
+    image: stock-pipeline-mlflow:2.22.1  # local build; don't reuse the official image name
     container_name: ACB_mlflow_server
     depends_on:
       - database
@@ -343,12 +355,14 @@ services:
       --serve-artifacts
       --artifacts-destination s3://${MLFLOW_BUCKET_NAME}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://0.0.0.0:${MLFLOW_PORT}/"]
+      # mlflow image has no curl; use its python
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5005/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
 
   spark-master:
+    restart: always
     build: ./PySpark
     environment:
       - SPARK_MODE=master
@@ -363,42 +377,46 @@ services:
     ports:
       - '8081:8081'
       - '7077:7077'
-    hostname: localhost
     user: "0:0" 
   spark-worker:
+    restart: always
     build: ./PySpark
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_MEMORY=2G
       - SPARK_WORKER_CORES=8
-      - SPARK_WORKER_WEBUI_PORT = 8082
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
       - SPARK_RPC_ENCRYPTION_ENABLED=false
       - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
       - SPARK_SSL_ENABLED=no
       - SPARK_NO_DAEMONIZE=true
     user: "0:0" 
-    hostname: localhost
     ports:
       - "8082:8081/tcp"
   spark-worker-2:
+    restart: always
     build: ./PySpark
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_MEMORY=2G
       - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_WEBUI_PORT = 8083
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
       - SPARK_RPC_ENCRYPTION_ENABLED=false
       - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
       - SPARK_SSL_ENABLED=no
       - SPARK_NO_DAEMONIZE=true
     user: "0:0" 
-    hostname: localhost
     ports:
       - "8083:8081/tcp"
+
+# Named volumes: data survives `docker compose down` and container recreation.
+# (Only `docker compose down -v` deletes them.)
+volumes:
+  acb-db-data:      # stock DB: acb_stock + MLflow tracking tables
+  minio-data:       # MinIO: MLflow artifacts, models, pipeline CSVs, plot
+  airflow-db-data:  # Airflow metadata: connections, DAG runs, users
 
 networks:
   frontend:

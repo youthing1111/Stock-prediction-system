@@ -1,23 +1,15 @@
 FROM apache/airflow:3.0.0
-#docker-compose up -d --build
-# Install deps as root.
-RUN pip install apache-airflow-providers-apache-spark
 
 USER root
-RUN  apt-get -y update && \
-    apt-get -y install python3-dev libhdf5-dev default-libmysqlclient-dev build-essential pkg-config && \
-    apt-get install -y --no-install-recommends openjdk-17-jdk && \
+RUN apt-get -y update && \
+    apt-get -y install --no-install-recommends python3-dev libhdf5-dev default-libmysqlclient-dev \
+        build-essential pkg-config openjdk-17-jdk-headless && \
+    ln -s "/usr/lib/jvm/java-17-openjdk-$(dpkg --print-architecture)" /usr/lib/jvm/java-17 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
-
-#ENV SPARK_HOME="/opt/spark"
-#ENV JAVA_HOME="/usr/lib/jvm/java-17-openjdk-arm64"
-#ENV PATH="${JAVA_HOME}:${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
-#RUN export JAVA_HOME
+# Architecture-independent path (works on arm64 and amd64)
+ENV JAVA_HOME=/usr/lib/jvm/java-17
 
 USER airflow
-# Install python requirements
-RUN pip install PyGithub 
-    #pip install tensorflow
-ENV JAVA_HOME="/usr/lib/jvm/java-17-openjdk-arm64"
-RUN export JAVA_HOME
-CMD ["bash"]
+COPY requirements.txt /requirements.txt
+COPY constraints.txt /constraints.txt
+RUN pip install --no-cache-dir -r /requirements.txt -c /constraints.txt
